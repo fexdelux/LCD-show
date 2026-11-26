@@ -1,0 +1,4 @@
+#!/bin/bash
+set -Eeuo pipefail
+here=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
+exec /usr/bin/python3 -EsB "$here/lumi-lcd/boot.py" install "$@"

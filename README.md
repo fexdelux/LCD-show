@@ -202,3 +202,6 @@ After execution, the system will automatically restart, and the display screen w
 
 
 
+## LUMI — LCD35 SPI no Raspberry Pi OS Lite
+
+Para o LCD35/MPI3501 compatível em um Raspberry Pi 3 ARM64, o projeto LUMI inclui instalação mínima de boot, diagnóstico e restauração, além de uma demo opcional em framebuffer RGB565 com toque evdev. Comece por `./LCD35-lite-show --dry-run` no Pi. Consulte [o guia LUMI em português](lumi-lcd/README.md) para confirmar o hardware, instalar, calibrar e validar o kernel.
