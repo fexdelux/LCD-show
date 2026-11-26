@@ -2,6 +2,7 @@
 import argparse
 import base64
 import contextlib
+import difflib
 import fcntl
 import hashlib
 import json
@@ -26,6 +27,7 @@ BEGIN = "# BEGIN LUMI LCD35"
 END = "# END LUMI LCD35"
 ROTATIONS = ("0", "90", "180", "270")
 PACKAGES = ("python3-pil", "python3-evdev", "fbset")
+SPI_DEVICES = Path("/sys/bus/spi/devices")
 
 
 class BootError(Exception):
@@ -65,19 +67,26 @@ def sha(data):
 
 def snapshot(path):
     path = safe_path(path, missing=True)
-    if not path.exists():
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except FileNotFoundError:
         return None
-    data = path.read_bytes()
-    info = path.stat()
+    with os.fdopen(fd, "rb") as stream:
+        info = os.fstat(stream.fileno())
+        if not stat.S_ISREG(info.st_mode):
+            raise BootError(f"Tipo inesperado: {path}")
+        data = stream.read()
     return {"data": base64.b64encode(data).decode(), "sha256": sha(data),
             "mode": stat.S_IMODE(info.st_mode), "uid": info.st_uid, "gid": info.st_gid}
 
 
 def payload(record):
+    if not isinstance(record, dict) or set(record) != {"data", "sha256", "mode", "uid", "gid"}:
+        raise BootError("Campos inválidos no registro de backup ou diário.")
     data = base64.b64decode(record["data"], validate=True)
     if sha(data) != record["sha256"]:
         raise BootError("Hash inválido no backup ou diário.")
-    if not all(type(record[key]) is int and record[key] >= 0 for key in ("mode", "uid", "gid")):
+    if not all(type(record[key]) is int and 0 <= record[key] < 2**32 - 1 for key in ("mode", "uid", "gid")):
         raise BootError("Permissões inválidas no backup ou diário.")
     if record["mode"] > 0o7777:
         raise BootError("Modo inválido no backup ou diário.")
@@ -141,7 +150,7 @@ def json_record(value):
     return record_for(json.dumps(value, indent=2).encode() + b"\n", mode=0o600)
 
 
-def rollback(root, changes, fat=False):
+def rollback_plan(root, changes, fat=False):
     pending = []
     seen = set()
     for name, previous, proposed in reversed(changes):
@@ -157,13 +166,19 @@ def rollback(root, changes, fat=False):
             continue
         if not equivalent(current, proposed, fat):
             raise BootError(f"{path} mudou durante a transação. Preserve o diário e revise manualmente.")
-        pending.append((path, previous))
-    for path, previous in pending:
-        replace(path, previous, fat)
+        pending.append((name, current, previous))
+    return pending
+
+
+def rollback(root, changes, fat=False):
+    for name, current, previous in rollback_plan(root, changes, fat):
+        if snapshot(root / name) != current:
+            raise BootError(f"{root / name} mudou durante a recuperação.")
+        replace(root / name, previous, fat)
 
 
 def transact(root, changes, fat=False):
-    changes = [(name, before, after) for name, before, after in changes if before != after]
+    changes = changed(changes)
     if not changes:
         return
     journal = root / JOURNAL
@@ -209,7 +224,7 @@ def strip_block(config, block):
     return strip_block(config[:-len(block)], None)
 
 
-def check_config(config):
+def check_config(config, root=None):
     """Accept only SPI settings whose effect is unambiguous across filters."""
     unconditional = True
     spi_enabled = False
@@ -228,18 +243,25 @@ def check_config(config):
             unconditional = line == "[all]"
             continue
         key, _, value = map(str.strip, line.partition("="))
-        name = re.split(r"[:,]", value, 1)[0].strip()
+        name = re.split(r"[:,]", value, maxsplit=1)[0].strip()
         conflict = (
             re.match(r"include(?:\s|=|$)", line)
             or key in ("overlay_prefix", "os_prefix", "device_tree", "gpio")
             or key == "dtoverlay" and (
                 (not name and value) or re.match(r"(?:spi0|tft|lcd|mhs|mis35|piscreen|ads7846|waveshare|pitft|"
-                                     r"panel-mipi-dbi|mcp251|sc16is|enc28j60|w5500)", name, re.I)
+                                     r"fbtft|panel-mipi-dbi|mcp251|sc16is|enc28j60|w5500)", name, re.I)
                 or re.search(r"\bspi0(?:[-_.0-9]|\b)", value, re.I))
         )
         if conflict:
             raise BootError(f"config.txt:{number}: possível conflito ({line}); revise antes de instalar.")
         if key == "dtoverlay":
+            if name and not re.fullmatch(r"[a-zA-Z0-9_-]+", name):
+                raise BootError(f"config.txt:{number}: nome de overlay inválido: {name}")
+            if root is not None and name:
+                path = root / "overlays" / f"{name}.dtbo"
+                item = snapshot(path)
+                if item and re.search(rb"(?:^|\0)(?:spi0(?:_cs_pins|_pins)?|spidev[01])\0", payload(item)):
+                    raise BootError(f"config.txt:{number}: {name} referencia SPI0 ou seus chip selects.")
             if name or unconditional:
                 overlay_scope = bool(name)
         if key in ("dtparam", "device_tree_param"):
@@ -252,11 +274,12 @@ def check_config(config):
     return spi_enabled, overlay_scope
 
 
-def read_manifest(saved, root, fat):
-    if saved is None:
-        return None
+def decode_manifest(saved):
     manifest = json.loads(payload(saved))
-    if manifest["version"] != 1 or manifest["paths"] != [CONFIG, OVERLAY]:
+    fields = {"version", "paths", "original_config", "overlay", "created_overlay", "block", "block_sha256"}
+    if (not isinstance(manifest, dict) or set(manifest) != fields
+            or type(manifest["version"]) is not int or manifest["version"] != 1
+            or manifest["paths"] != [CONFIG, OVERLAY]):
         raise BootError("Manifesto incompatível.")
     for entry in ("original_config", "overlay"):
         payload(manifest[entry])
@@ -264,8 +287,6 @@ def read_manifest(saved, root, fat):
         raise BootError("Overlay do manifesto não corresponde ao ativo validado.")
     if type(manifest["created_overlay"]) is not bool:
         raise BootError("Manifesto inválido.")
-    if not equivalent(snapshot(root / OVERLAY), manifest["overlay"], fat):
-        raise BootError("Overlay ausente ou alterado desde a instalação. Revise antes de continuar.")
     block = base64.b64decode(manifest["block"], validate=True)
     if sha(block) != manifest["block_sha256"] or block not in {
         managed_block(base, angle, spi, scope) for base in (b"", b"x", b"x\r\ny", b"x\r\n")
@@ -274,6 +295,55 @@ def read_manifest(saved, root, fat):
         raise BootError("Bloco do manifesto inválido.")
     manifest["block"] = block
     return manifest
+
+
+def read_manifest(saved, root, fat):
+    if saved is None:
+        return None
+    manifest = decode_manifest(saved)
+    if not equivalent(snapshot(root / OVERLAY), manifest["overlay"], fat):
+        raise BootError("Overlay ausente ou alterado desde a instalação. Revise antes de continuar.")
+    return manifest
+
+
+def pending_changes(saved):
+    """Validate the original journal format before using any saved paths or data."""
+    changes = json.loads(payload(saved))
+    if (not isinstance(changes, list) or not changes
+            or any(not isinstance(item, list) or len(item) != 3 for item in changes)):
+        raise BootError("Estrutura inválida no diário.")
+    names = [item[0] for item in changes]
+    entries = (CONFIG, OVERLAY, STATE)
+    if any(name not in entries for name in names) or len(set(names)) != len(names) or STATE not in names:
+        raise BootError("Caminhos inválidos no diário.")
+    by_name = {name: (before, after) for name, before, after in changes}
+    old_state, new_state = by_name[STATE]
+    installing = new_state is not None
+    order = (OVERLAY, CONFIG, STATE) if installing else entries
+    if names != [name for name in order if name in by_name] or (old_state is None and new_state is None):
+        raise BootError("Ordem ou estados inválidos no diário.")
+    old = decode_manifest(old_state) if old_state is not None else None
+    new = decode_manifest(new_state) if installing else None
+    if old and new and any(old[key] != new[key] for key in ("original_config", "overlay", "created_overlay")):
+        raise BootError("Reinstalação no diário alteraria o backup original.")
+    if CONFIG in by_name:
+        before, after = map(payload, by_name[CONFIG])
+        if strip_block(before, old["block"] if old else None) != strip_block(after, new["block"] if new else None):
+            raise BootError("O diário modificaria linhas fora do bloco LUMI.")
+        if new and not old and by_name[CONFIG][0] != new["original_config"]:
+            raise BootError("Backup original do diário não corresponde ao config.txt.")
+    elif not old or not new or old["block"] != new["block"]:
+        raise BootError("Configuração obrigatória ausente no diário.")
+    if OVERLAY in by_name:
+        previous, proposed = by_name[OVERLAY]
+        owner = new if installing else old
+        candidate = proposed if installing else previous
+        if (not owner["created_overlay"] or (previous if installing else proposed) is not None
+                or sha(payload(candidate)) != OVERLAY_SHA):
+            raise BootError("Alteração de overlay inválida no diário.")
+    elif (not old or not new) and (old or new)["created_overlay"]:
+        raise BootError("Alteração obrigatória do overlay ausente no diário.")
+    return changes
 
 
 def plan(root, action, rotate="90", fat=False):
@@ -287,13 +357,13 @@ def plan(root, action, rotate="90", fat=False):
         if manifest is None:
             return []
         if manifest["created_overlay"]:
-            check_config(base)
+            check_config(base, root)
         changes = [(CONFIG, current, record_for(base, current))]
         if manifest["created_overlay"]:
             changes.append((OVERLAY, snapshot(root / OVERLAY), None))
         return changes + [(STATE, saved, None)]
 
-    spi_enabled, overlay_scope = check_config(base)
+    spi_enabled, overlay_scope = check_config(base, root)
     overlay = snapshot(root / OVERLAY)
     if overlay is None:
         asset = ASSET.read_bytes()
@@ -385,11 +455,15 @@ def status(root, explicit, fb):
             print(f"{root / name}: " + (item["sha256"] if item else "ausente"))
             if item and name == CONFIG:
                 print(payload(item).decode(errors="replace"))
+            if item and name == OVERLAY and item["sha256"] != OVERLAY_SHA:
+                print("Overlay difere do binário tft35a auditado.")
+            if item and name == JOURNAL:
+                print("Transação pendente: consulte LCD35-lite-restore --recover-only --dry-run.")
     if explicit:
         print("Modo imagem: os dispositivos do host não representam o sistema da imagem.")
         return
     drivers()
-    for spi in sorted(Path("/sys/bus/spi/devices").glob("spi*")):
+    for spi in sorted(SPI_DEVICES.glob("spi*")):
         driver = spi / "driver"
         print(f"{spi.name}: {read_text(spi / 'modalias')} "
               f"driver={driver.resolve().name if driver.is_symlink() else '(sem vínculo)'}")
@@ -416,7 +490,7 @@ def status(root, explicit, fb):
               f"ABS={read_text(event / 'device/capabilities/abs')} "
               f"KEY={read_text(event / 'device/capabilities/key')}")
     modules = read_text("/proc/modules").splitlines()
-    relevant = re.compile(r"ili9486|ads7846|fbtft|spi[_-]bcm|tft35a|spi0|pinctrl", re.I)
+    relevant = re.compile(r"ili9486|ads7846|fbtft|spi[_-]bcm|tft35a|spi0|pinctrl|under.?voltage", re.I)
     print("Módulos carregados:", ", ".join(line.split()[0] for line in modules if relevant.search(line)) or "(nenhum)")
     try:
         logs = subprocess.run(["dmesg"], capture_output=True, text=True, check=False)
@@ -424,6 +498,46 @@ def status(root, explicit, fb):
               or logs.stderr.strip() or "(sem mensagens relevantes)")
     except OSError as error:
         print(f"dmesg indisponível: {error}")
+
+
+def check_live_spi():
+    for name, expected in (("spi0.0", "fb_ili9486"), ("spi0.1", "ads7846")):
+        node = SPI_DEVICES / name
+        if not node.exists():
+            continue
+        link = node / "driver"
+        driver = link.resolve().name if link.is_symlink() else None
+        alias = read_text(node / "modalias")
+        compatible = read_text(node / "of_node/compatible").split("\0")
+        expected_compatible = "ilitek,ili9486" if name == "spi0.0" else "ti,ads7846"
+        if driver in ("spidev", expected):
+            continue
+        if driver is None and (alias == "spi:spidev" or expected_compatible in compatible):
+            continue
+        raise BootError(f"{name} já está ocupado ({driver or 'sem vínculo'}, {alias}). Revise o Device Tree ativo.")
+
+
+def changed(changes):
+    return [(name, before, after) for name, before, after in changes if before != after]
+
+
+def show_plan(root, changes, journal=False):
+    if not changes:
+        print("Arquivos de boot já estão no estado solicitado.")
+        return
+    if journal:
+        print(f"Plano: criar diário {root / JOURNAL} para guardar o estado anterior e removê-lo após concluir.")
+    for name, before, after in changes:
+        verb = "remover" if after is None else "criar" if before is None else "modificar"
+        print(f"Plano: {verb} {root / name}", flush=True)
+        if name == CONFIG:
+            original = payload(before).decode().splitlines(keepends=True)
+            proposed = payload(after).decode().splitlines(keepends=True)
+            for line in difflib.unified_diff(original, proposed, fromfile="config.txt atual",
+                                             tofile="config.txt proposto"):
+                print(line.rstrip("\r\n"))
+                if not line.endswith("\n"):
+                    print("\\ Sem nova linha no fim do arquivo")
 
 
 def stop(signum, _frame):
@@ -441,6 +555,8 @@ def main():
     if action == "install":
         parser.add_argument("--rotate", choices=ROTATIONS, default="90")
         parser.add_argument("--install-demo", action="store_true", help="instalar dependências opcionais via apt")
+    if action == "restore":
+        parser.add_argument("--recover-only", action="store_true", help="reverter somente a transação pendente")
     args = parser.parse_args(sys.argv[2:])
     explicit = args.boot_dir is not None
     if action == "status":
@@ -469,26 +585,30 @@ def main():
             raise BootError("Sistema ou userland não reconhecido para o alvo ARM64.")
         if not drivers():
             raise BootError("Drivers necessários não confirmados no kernel alvo.")
+        check_live_spi()
     root = boot_path(args.boot_dir)
     safe_path(root / "overlays", directory=True)
     fat = fat_boot(root)
     with contextlib.nullcontext() if args.dry_run else boot_lock(root):
         pending = snapshot(root / JOURNAL)
+        recover = getattr(args, "recover_only", False)
         if pending is not None:
-            if action != "restore" or args.dry_run:
-                raise BootError(f"Transação pendente em {root / JOURNAL}. Revise e execute restore.")
-            rollback(root, json.loads(payload(pending)), fat)
-            replace(root / JOURNAL, None)
-        changes = plan(root, action, getattr(args, "rotate", "90"), fat)
-        for name, before, after in changes:
-            if before != after:
-                verb = "remover" if after is None else "gravar"
-                print(f"Plano: {verb} {root / name}", flush=True)
-                if name == CONFIG and action == "install":
-                    marker = payload(after).rindex(BEGIN.encode())
-                    print(payload(after)[marker:].decode(), end="", flush=True)
-        if not any(before != after for _, before, after in changes):
-            print("Arquivos de boot já estão no estado solicitado.")
+            if not recover:
+                raise BootError(f"Transação pendente em {root / JOURNAL}. "
+                                "Use LCD35-lite-restore --recover-only --dry-run para revisar.")
+            history = pending_changes(pending)
+            changes = rollback_plan(root, history, fat)
+            show_plan(root, changes + [(JOURNAL, pending, None)])
+            if not args.dry_run:
+                rollback(root, history, fat)
+                replace(root / JOURNAL, None)
+                print("Transação pendente revertida.")
+            return
+        if recover:
+            print("Nenhuma transação pendente.")
+            return
+        changes = changed(plan(root, action, getattr(args, "rotate", "90"), fat))
+        show_plan(root, changes, journal=True)
         if demo:
             print("Plano: apt-get install --no-install-recommends " + " ".join(PACKAGES), flush=True)
         if args.dry_run:
@@ -501,6 +621,8 @@ def main():
 
 if __name__ == "__main__":
     signal.signal(signal.SIGTERM, stop)
+    signal.signal(signal.SIGHUP, stop)
+    signal.signal(signal.SIGINT, stop)
     try:
         main()
     except (BootError, OSError, ValueError, KeyError, TypeError, subprocess.CalledProcessError) as exc:

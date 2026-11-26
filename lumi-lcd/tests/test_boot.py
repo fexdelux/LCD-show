@@ -1,9 +1,14 @@
+from contextlib import redirect_stdout
+from io import StringIO
 from pathlib import Path
 import os
 import subprocess
 import tempfile
+import sys
 import unittest
 from unittest.mock import patch
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import boot
 
@@ -217,3 +222,139 @@ class BootTests(unittest.TestCase):
             self.assertEqual(boot.boot_path(None), fake)
             (firmware / boot.CONFIG).touch()
             self.assertEqual(boot.boot_path(None), firmware)
+
+    def test_recovery_dry_run_and_real_recovery_keep_previous_installation(self):
+        self.apply(rotate="90")
+        original = self.config.read_bytes()
+        changes = boot.changed(boot.plan(self.root, "install", "180"))
+        journal = self.root / boot.JOURNAL
+        boot.replace(journal, boot.json_record(changes))
+        boot.replace(self.config, changes[0][2])
+        interrupted = self.config.read_bytes()
+        result = self.run_cli("restore", "--boot-dir", self.root, "--recover-only", "--dry-run")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("-dtoverlay=tft35a:rotate=180", result.stdout)
+        self.assertIn("+dtoverlay=tft35a:rotate=90", result.stdout)
+        self.assertEqual(self.config.read_bytes(), interrupted)
+        self.assertTrue(journal.exists())
+        argv = ["boot.py", "restore", "--boot-dir", str(self.root), "--recover-only"]
+        # Exercise the real entry point against an explicit fixture, without elevating privileges.
+        with patch.object(sys, "argv", argv), patch("boot.os.geteuid", return_value=0), redirect_stdout(StringIO()):
+            boot.main()
+        self.assertEqual(self.config.read_bytes(), original)
+        self.assertTrue(self.overlay.exists())
+        self.assertFalse(journal.exists())
+
+    def test_invalid_journal_rejected_before_any_write(self):
+        expected = self.config.read_bytes()
+        changes = boot.changed(boot.plan(self.root, "install"))
+        for history in (
+            {}, [None],
+            [*changes, changes[-1]],
+            [*changes[1:], changes[0]],
+            [("outside", None, changes[0][2]), *changes[1:]],
+            [(boot.OVERLAY, None, boot.record_for(b"invalid")), *changes[1:]],
+            [changes[0], (boot.CONFIG, changes[1][1],
+                          boot.record_for(b"dtparam=audio=off\n" + boot.managed_block(b"", "90"))),
+             changes[-1]],
+        ):
+            with self.subTest(history_type=type(history)):
+                boot.replace(self.root / boot.JOURNAL, boot.json_record(history))
+                result = self.run_cli("restore", "--boot-dir", self.root, "--recover-only", "--dry-run")
+                self.assertNotEqual(result.returncode, 0)
+                self.assertNotIn("Traceback", result.stderr)
+                self.assertEqual(self.config.read_bytes(), expected)
+                self.assertFalse(self.overlay.exists())
+
+    def test_recovery_preflights_all_paths_before_reverting_any(self):
+        changes = boot.changed(boot.plan(self.root, "install"))
+        boot.replace(self.root / boot.JOURNAL, boot.json_record(changes))
+        boot.replace(self.root / boot.STATE, changes[-1][2])
+        self.config.write_bytes(b"foreign change\n")
+        result = self.run_cli("restore", "--boot-dir", self.root, "--recover-only", "--dry-run")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertTrue((self.root / boot.STATE).exists())
+        self.assertTrue((self.root / boot.JOURNAL).exists())
+
+    def test_dry_run_shows_diff_and_preserves_full_pi_fixture(self):
+        config = (b"dtparam=audio=on\n[all]\ndtoverlay=vc4-kms-v3d\n"
+                  b"max_framebuffers=2\n[pi4]\narm_boost=1\n[all]\n")
+        self.config.write_bytes(config)
+        result = self.run_cli("show", "--dry-run", "--boot-dir", self.root)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("+dtoverlay=tft35a:rotate=90\n+dtoverlay=\n+dtparam=spi=on", result.stdout)
+        self.assertIn(boot.JOURNAL, result.stdout)
+        self.assertNotIn("-dtoverlay=vc4-kms-v3d", result.stdout)
+        self.assertEqual(self.config.read_bytes(), config)
+        self.assertFalse((self.root / boot.JOURNAL).exists())
+        self.assertFalse((self.root / boot.STATE).exists())
+        self.assertFalse(self.overlay.exists())
+        self.apply()
+        self.assertTrue(self.config.read_bytes().startswith(config))
+        self.assertEqual(self.config.read_bytes().count(b"dtoverlay=vc4-kms-v3d"), 1)
+
+    def test_native_driver_absence_stops_before_boot_access(self):
+        distro = "ID=debian\nVERSION_ID=13"
+        with patch.object(sys, "argv", ["boot.py", "install", "--dry-run"]), \
+                patch.object(boot, "host", return_value=("Raspberry Pi 3 Model B Rev 1.2", distro)), \
+                patch("boot.platform.machine", return_value="aarch64"), \
+                patch.object(boot, "drivers", return_value=False), patch.object(boot, "boot_path") as path:
+            with self.assertRaisesRegex(boot.BootError, "Drivers necessários"):
+                boot.main()
+            path.assert_not_called()
+
+    def test_live_spi_refuses_another_driver(self):
+        node = self.root / "spi0.0"
+        node.mkdir()
+        driver = self.root / "spidev"
+        driver.mkdir()
+        (node / "driver").symlink_to(driver)
+        with patch.object(boot, "SPI_DEVICES", self.root):
+            boot.check_live_spi()
+            (node / "driver").unlink()
+            (node / "driver").symlink_to(self.root / "ili9486")
+            with self.assertRaisesRegex(boot.BootError, "spi0.0 já está ocupado"):
+                boot.check_live_spi()
+
+    def test_other_display_overlays_and_custom_spi0_reference_are_rejected(self):
+        (self.overlay.parent / "peripheral.dtbo").write_bytes(b"sample\0spi0\0data")
+        for name in ("fbtft", "ads7846", "peripheral"):
+            self.config.write_text(f"dtoverlay={name}\n")
+            with self.subTest(name=name), self.assertRaises(boot.BootError):
+                self.apply()
+
+    def test_signals_trigger_rollback_after_rename(self):
+        import signal
+
+        config = self.config.read_bytes()
+        real_replace = boot.replace
+
+        def interrupt(path, record, fat=False):
+            real_replace(path, record, fat)
+            if path == self.config and boot.payload(record) != config:
+                boot.stop(signal.SIGINT, None)
+
+        with patch.object(boot, "replace", side_effect=interrupt), self.assertRaises(InterruptedError):
+            self.apply()
+        self.assertEqual(self.config.read_bytes(), config)
+        self.assertFalse(self.overlay.exists())
+        self.assertFalse((self.root / boot.JOURNAL).exists())
+
+    def test_journal_validation_accepts_interrupted_initial_install_and_restore(self):
+        before = self.config.read_bytes()
+        for action in ("install", "restore"):
+            with self.subTest(action=action):
+                state = boot.snapshot(self.root / boot.STATE)
+                config = self.config.read_bytes()
+                changes = boot.changed(boot.plan(self.root, action))
+                journal = boot.json_record(changes)
+                for name, _, proposed in changes[:-1]:
+                    boot.replace(self.root / name, proposed)
+                boot.rollback(self.root, boot.pending_changes(journal))
+                self.assertEqual(self.config.read_bytes(), config)
+                self.assertEqual(boot.snapshot(self.root / boot.STATE), state)
+                self.assertEqual(self.overlay.exists(), state is not None)
+                if action == "install":
+                    self.apply()
+        self.apply("restore")
+        self.assertEqual(self.config.read_bytes(), before)

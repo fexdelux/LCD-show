@@ -1,6 +1,9 @@
 from pathlib import Path
 import tempfile
+import sys
 import unittest
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from framebuffer import FixInfo, Layout, VarInfo, candidates, draw_rgb, rgb565
 from touch import TARGETS, apply_affine, fit_calibration, load_calibration, normalize, orient, save_calibration
@@ -48,6 +51,9 @@ class DisplayTests(unittest.TestCase):
             root = Path(temp)
             spi = root / "spi0.0"
             spi.mkdir()
+            driver = root / "fb_ili9486"
+            driver.mkdir()
+            (spi / "driver").symlink_to(driver)
             hdmi = root / "platform"
             hdmi.mkdir()
             devices = root / "dev"
@@ -98,6 +104,7 @@ class DeviceIOTests(unittest.TestCase):
         def ioctl(_fd, request, info):
             if request == FBIOGET_FSCREENINFO:
                 info.visual, info.smem_len, info.line_length = 2, 16, 8
+                info.id = b"fb_ili9486"
             else:
                 self.assertEqual(request, FBIOGET_VSCREENINFO)
                 info.xres, info.yres, info.xres_virtual, info.yres_virtual = 2, 1, 4, 2
@@ -108,13 +115,13 @@ class DeviceIOTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             fixture = Path(temp) / "framebuffer"
             fixture.write_bytes(b"\xaa" * 16)
-            with patch("framebuffer.select_fb", return_value=fixture), patch("framebuffer.fcntl.ioctl", ioctl):
+            with patch("framebuffer.select_fb", return_value=fixture), \
+                    patch("framebuffer.verify_write_target"), patch("framebuffer.fcntl.ioctl", ioctl):
                 with Framebuffer() as fb:
                     draw_rgb(fb.buffer, fb.layout, bytes((0, 255, 0)) * 2, "little")
             self.assertEqual(fixture.read_bytes(), b"\xaa" * 10 + bytes.fromhex("e007 e007 aaaa"))
 
     def test_touch_events_at_release_and_after_dropped_sync(self):
-        import sys
         from types import SimpleNamespace
         from unittest.mock import patch
         from touch import Touch
@@ -134,3 +141,135 @@ class DeviceIOTests(unittest.TestCase):
         )
         with patch.dict(sys.modules, {"evdev": SimpleNamespace(ecodes=codes)}):
             self.assertEqual(list(Touch(device).taps()), [(0.2, 0.4), (0.25, 0.7)])
+
+    def test_fbtft_nonstd_flag_requires_known_id_and_16_bit_fields(self):
+        fix, var = FixInfo(), VarInfo()
+        fix.id, fix.visual = b"fb_ili9486", 2
+        var.bits_per_pixel, var.nonstd = 16, 1
+        for field, offset, size in ((var.red, 11, 5), (var.green, 5, 6), (var.blue, 0, 5)):
+            field.offset, field.length = offset, size
+        for width, height in ((480, 320), (320, 480)):
+            var.xres = var.xres_virtual = width
+            var.yres = var.yres_virtual = height
+            fix.line_length = width * 2 + 8
+            fix.smem_len = fix.line_length * height
+            self.assertEqual(Layout.from_info(fix, var).width, width)
+        var.xoffset = 1
+        with self.assertRaisesRegex(ValueError, "limites virtuais"):
+            Layout.from_info(fix, var)
+        var.xoffset = 0
+        fix.id = b"vc4drmfb"
+        with self.assertRaisesRegex(ValueError, "Formato"):
+            Layout.from_info(fix, var)
+
+    def test_no_spi_framebuffer_or_ambiguous_selection(self):
+        from unittest.mock import patch
+        from framebuffer import Framebuffer
+
+        for devices, message in (([], "Nenhum"), ([Path("/dev/fb1"), Path("/dev/fb2")], "Vários")):
+            with patch("framebuffer.candidates", return_value=devices):
+                with self.assertRaisesRegex(ValueError, message):
+                    Framebuffer()
+
+    def test_explicit_hdmi_rejected_before_ioctl_or_mapping(self):
+        from types import SimpleNamespace
+        from unittest.mock import patch
+        from framebuffer import Framebuffer
+        import stat
+
+        with patch("framebuffer.os.open", return_value=123), patch("framebuffer.os.close") as close, \
+                patch("framebuffer.os.fstat", return_value=SimpleNamespace(st_mode=stat.S_IFCHR)), \
+                patch("framebuffer.spi_panel", return_value=False), patch("framebuffer.fcntl.ioctl") as ioctl, \
+                patch("framebuffer.mmap.mmap") as mapping:
+            with self.assertRaisesRegex(ValueError, "SPI ILI9486"):
+                with Framebuffer("/dev/fb0"):
+                    self.fail("HDMI opened for drawing")
+            close.assert_called_once_with(123)
+            ioctl.assert_not_called()
+            mapping.assert_not_called()
+
+    def test_framebuffer_permission_error_names_device(self):
+        from unittest.mock import patch
+        from framebuffer import Framebuffer
+
+        with patch("framebuffer.os.open", side_effect=PermissionError):
+            with self.assertRaisesRegex(PermissionError, "/dev/fb4"):
+                with Framebuffer("/dev/fb4"):
+                    self.fail("permission denied")
+
+    def test_touch_spi_capabilities_exclude_usb_and_incomplete_devices(self):
+        from types import SimpleNamespace
+        from unittest.mock import Mock, patch
+        from touch import open_touch
+
+        codes = SimpleNamespace(EV_KEY=1, EV_ABS=3, ABS_X=0, ABS_Y=1, BTN_TOUCH=330, BUS_SPI=28)
+        correct = {3: [0, 1], 1: [330]}
+        usb = Mock(name="usb", info=SimpleNamespace(bustype=3))
+        usb.name = "ADS7846 Touchscreen"
+        usb.capabilities.return_value = correct
+        incomplete = Mock(info=SimpleNamespace(bustype=28))
+        incomplete.name = "ADS7846 Touchscreen"
+        incomplete.capabilities.return_value = {3: [0, 1]}
+        spi = Mock(info=SimpleNamespace(bustype=28))
+        spi.name = "ADS7846 Touchscreen"
+        spi.capabilities.return_value = correct
+        evdev = SimpleNamespace(ecodes=codes, InputDevice=Mock(side_effect=[usb, incomplete, spi]))
+        with patch.dict(sys.modules, {"evdev": evdev}), patch("touch.touch_paths", return_value=["a", "b", "c"]):
+            self.assertIs(open_touch(), spi)
+        usb.close.assert_called_once()
+        incomplete.close.assert_called_once()
+        spi.close.assert_not_called()
+
+    def test_touch_permission_and_disconnect_are_actionable(self):
+        from types import SimpleNamespace
+        from unittest.mock import Mock, patch
+        from touch import Touch, open_touch
+
+        codes = SimpleNamespace(ABS_X=0, ABS_Y=1)
+        evdev = SimpleNamespace(ecodes=codes, InputDevice=Mock(side_effect=PermissionError))
+        device = SimpleNamespace(name="ADS7846 Touchscreen", phys="spi0.1/input0",
+                                 absinfo=lambda axis: SimpleNamespace(min=0, max=4095, value=2),
+                                 read=lambda: [])
+        with patch.dict(sys.modules, {"evdev": evdev}):
+            with self.assertRaisesRegex(PermissionError, "/dev/input/event2"):
+                open_touch("/dev/input/event2")
+            with self.assertRaisesRegex(OSError, "desconectado"):
+                list(Touch(device).taps())
+
+    def test_demo_coalesces_updates_and_blocks_when_static(self):
+        from contextlib import ExitStack
+        from types import SimpleNamespace
+        from unittest.mock import Mock, patch
+        import demo
+
+        args = SimpleNamespace(fb=None, without_touch=False, touch=None, rotate=90,
+                               calibrate=False, calibration=None, swap_axes=False,
+                               invert_x=False, invert_y=False, state="aguardando")
+        fb = Mock()
+        fb.__enter__ = Mock(return_value=SimpleNamespace(layout=Layout(480, 320, 960, 0, 0, 307200)))
+        fb.__exit__ = Mock()
+        device = Mock(fd=4)
+        touch = Mock(identity={})
+        touch.taps.side_effect = [[(0.2, 0.3)], [(0.4, 0.5)]]
+        selector = Mock()
+        selector.__enter__ = Mock(return_value=selector)
+        selector.__exit__ = Mock()
+        selector.select.side_effect = [True, True, False, KeyboardInterrupt]
+        times = [0, 0.01, 0.02, 0.03, 0.04, demo.FRAME_INTERVAL]
+        with ExitStack() as resources:
+            resources.enter_context(patch("demo.os.geteuid", return_value=1000))
+            resources.enter_context(patch("demo.Framebuffer", return_value=fb))
+            resources.enter_context(patch("demo.open_touch", return_value=device))
+            resources.enter_context(patch("demo.Touch", return_value=touch))
+            resources.enter_context(patch("demo.DefaultSelector", return_value=selector))
+            resources.enter_context(patch("demo.monotonic", side_effect=times))
+            draw = resources.enter_context(patch("demo.draw"))
+            with self.assertRaises(KeyboardInterrupt):
+                demo.run(args, resources)
+            self.assertEqual([call.args[1] for call in draw.call_args_list], ["aguardando", "processando"])
+            timeouts = [call.args[0] for call in selector.select.call_args_list]
+            self.assertIsNone(timeouts[0])
+            self.assertGreater(timeouts[1], 0)
+            self.assertGreater(timeouts[2], 0)
+            self.assertIsNone(timeouts[3])
+        device.close.assert_called_once()

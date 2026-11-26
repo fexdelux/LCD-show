@@ -1,9 +1,11 @@
 """Read resistive touch events and persist a five-point affine calibration."""
+import errno
 import itertools
 import json
 import math
 import os
 from pathlib import Path
+import re
 import tempfile
 
 
@@ -83,31 +85,50 @@ def load_calibration(path, identity):
     return matrix
 
 
+TOUCH_NAME = re.compile(r"\b(?:ads7846|xpt2046|tft35a)\b", re.IGNORECASE)
+
+
+def touch_paths():
+    for entry in sorted(Path("/sys/class/input").glob("event[0-9]*")):
+        try:
+            name = (entry / "device/name").read_text(errors="replace")
+        except FileNotFoundError:
+            continue
+        if TOUCH_NAME.search(name):
+            yield f"/dev/input/{entry.name}"
+
+
 def open_touch(explicit=None):
     import evdev
     from evdev import ecodes as e
 
-    if explicit is None:
-        paths = [
-            f"/dev/input/{entry.name}" for entry in Path("/sys/class/input").glob("event*")
-            if (entry / "device/name").is_file()
-            and any(name in (entry / "device/name").read_text(errors="replace").lower()
-                    for name in ("ads7846", "xpt2046", "tft35a"))
-        ]
-    else:
-        paths = [os.fspath(explicit)]
+    paths = [os.fspath(explicit)] if explicit is not None else touch_paths()
     selected = []
+    unreadable = []
     try:
         for path in paths:
-            device = evdev.InputDevice(path)
+            try:
+                device = evdev.InputDevice(path)
+            except PermissionError:
+                unreadable.append(path)
+                continue
+            except OSError as error:
+                if explicit is None and error.errno in (errno.ENOENT, errno.ENODEV):
+                    continue
+                raise OSError(f"{path}: {error}. Confira a conexão do touchscreen.") from error
             selected.append(device)  # Also closed if capability inspection fails.
             cap = device.capabilities(absinfo=False)
-            if not ({e.ABS_X, e.ABS_Y} <= set(cap.get(e.EV_ABS, []))
+            if not (device.info.bustype == e.BUS_SPI and TOUCH_NAME.search(device.name or "")
+                    and {e.ABS_X, e.ABS_Y} <= set(cap.get(e.EV_ABS, []))
                     and e.BTN_TOUCH in cap.get(e.EV_KEY, [])):
                 selected.pop().close()
+        if unreadable:
+            raise PermissionError("Sem acesso ao touch em " + ", ".join(unreadable)
+                                  + ". Confira as permissões ou indique outro ADS7846 SPI com --touch.")
         if len(selected) == 1:
             return selected.pop()
-        raise ValueError(f"Encontrados {len(selected)} touchscreens resistivos. Use --touch /dev/input/eventN.")
+        raise ValueError(f"Encontrados {len(selected)} touchscreens ADS7846 SPI com ABS_X, ABS_Y e BTN_TOUCH. "
+                         "Consulte LCD35-lite-status ou use --touch /dev/input/eventN.")
     finally:
         for device in selected:
             device.close()
@@ -119,10 +140,13 @@ class Touch:
 
         self.e = ecodes
         self.device = device
-        self.limits = [(ax.min, ax.max) for ax in map(device.absinfo, (ecodes.ABS_X, ecodes.ABS_Y))]
+        axes = [device.absinfo(axis) for axis in (ecodes.ABS_X, ecodes.ABS_Y)]
+        if any(axis is None or axis.max <= axis.min for axis in axes):
+            raise ValueError("Faixas ABS_X/ABS_Y inválidas no touchscreen.")
+        self.limits = [(axis.min, axis.max) for axis in axes]
         self.identity = {"name": device.name, "phys": device.phys,
                          "limits": [list(axis) for axis in self.limits]}
-        self.values = self.axis_values()
+        self.values = [axis.value for axis in axes]
         self.pressed = False
         self.tapped = False
         self.dropped = False
@@ -132,7 +156,15 @@ class Touch:
 
     def taps(self):
         e = self.e
-        for event in self.device.read():
+        try:
+            events = list(self.device.read())
+        except BlockingIOError:
+            return
+        except OSError as error:
+            raise OSError(f"Leitura do touchscreen falhou ({error}). Confira a conexão e reinicie a demo.") from error
+        if not events:
+            raise OSError("Touchscreen desconectado. Reconecte e reinicie a demo.")
+        for event in events:
             if event.type == e.EV_SYN and event.code == e.SYN_DROPPED:
                 self.dropped = True
                 self.tapped = False

@@ -2,6 +2,12 @@
 
 Renderização direta no framebuffer Linux, com Pillow na demonstração e evdev para o touch resistivo. O driver do painel funciona no kernel, independentemente de X11 ou Wayland. O alvo primário é Raspberry Pi 3 B/B+/A+, Raspberry Pi OS Lite ARM64 e painel LCD35/MPI3501 de 480 × 320 com ILI9486 e ADS7846 ou equivalente compatível. Confirme a placa e a revisão antes de conectar. Outras telas de 3,5″ podem usar interfaces e pinagens diferentes.
 
+## Arquitetura e ambiente de referência
+
+Os comandos Bash chamam `boot.py` com a biblioteca padrão do Python. O firmware aplica o overlay e o kernel fornece os dispositivos fbdev e evdev. `framebuffer.py` valida o framebuffer SPI via sysfs e ioctl, `touch.py` lê o ADS7846 e `demo.py` usa Pillow para desenhar. Pillow, evdev e fbset são opcionais para o instalador. O driver pode ser instalado e diagnosticado antes de instalar a demo.
+
+A referência de homologação é Raspberry Pi 3 Model B Rev 1.2, Raspberry Pi OS Lite ARM64 baseado no Debian 13 Trixie, Python 3.13 e kernel `6.18.60+rpt-rpi-v8`. O equipamento reportou 904 MiB de RAM, zram de 904 MiB e swap em disco de 2 GiB. Antes da instalação, o framebuffer observado era `vc4drmfb` em `/dev/fb0`, 1024 × 600, 16 bpp e stride de 2048 bytes. O diagnóstico remoto informado confirmou a presença dos módulos nativos. A ativação do LCD, do touchscreen e as medições após instalação ainda exigem teste no equipamento. [Python do Debian 13](https://packages.debian.org/trixie/python3)
+
 ## Auditoria e compatibilidade
 
 A auditoria partiu de `feature/lumi-project`, commit `a36c00a` (`modify hdmi shell`). O clone continha os scripts legados na raiz, templates em `boot/`, configurações em `etc/` e overlays, utilitários e arquivos de calibração em `usr/`. `LUMI-LCD-CODEX.md` e seu arquivo `Zone.Identifier` já estavam sem rastreamento. O fluxo de `LCD35-show` passa por backup/restauração legados, troca de templates, ajustes de HDMI, UART e I²C, configuração de Xorg/Wayland, fbcp, calibração X11 e reinicialização. Os comandos Lite usam apenas o ativo do painel.
@@ -18,6 +24,8 @@ O binário `usr/tft35a-overlay.dtb` foi inspecionado como FDT, pois `dtc` estava
 
 O driver `fb_ili9486` registra o mesmo compatible e implementa 0°, 90°, 180° e 270°. A instalação no Pi verifica a presença de `fb_ili9486`, `ads7846` e `spi_bcm2835` por metadados do kernel, sysfs ou módulos. O defconfig ARM64 de referência da árvore Raspberry Pi 6.12 habilita os três como módulos. Essa evidência é estática. A aplicação dos fixups pelo firmware, a vinculação e o funcionamento no painel ainda precisam ser validados. [Driver Raspberry Pi Linux](https://github.com/raspberrypi/linux/blob/rpi-6.18.y/drivers/staging/fbtft/fb_ili9486.c) · [Defconfig ARM64 6.12](https://github.com/raspberrypi/linux/blob/rpi-6.12.y/arch/arm64/configs/bcm2711_defconfig)
 
+O FBTFT 6.18 anuncia RGB565 com `nonstd=1`. O renderizador aceita esse caso para `fb_ili9486` com bitfields RGB565 e layout íntegro. Para escrita, até uma seleção explícita exige pai SPI vinculado a `fb_ili9486`, número major/minor coerente com o sysfs e ID correspondente no ioctl. O status pode inspecionar HDMI com `--fb` em modo somente leitura. O DT do VC4 continua intacto. [Código FBTFT 6.18](https://github.com/raspberrypi/linux/blob/rpi-6.18.y/drivers/staging/fbtft/fbtft-core.c)
+
 | Ambiente | Situação |
 | --- | --- |
 | Pi 3, Raspberry Pi OS Lite ARM64 com layout moderno `/boot/firmware` | Alvo. Localização e planejamento testados em fixture. Firmware, kernel da imagem e painel pendentes. |
@@ -26,7 +34,7 @@ O driver `fb_ili9486` registra o mesmo compatible e implementa 0°, 90°, 180° 
 
 ## Instalar e diagnosticar
 
-Requer Bash e Python 3.9+ no alvo. Confira o modelo, a versão e o plano antes de gravar:
+Requer Bash e Python 3.9+ no alvo. O dry-run exibe o diff do `config.txt`, o plano dos arquivos de boot e, quando solicitado, a linha de apt opcional. Os comandos de consulta usam `modinfo` quando disponível e não carregam módulos. Confira o modelo, a versão e o plano antes de gravar:
 
 ```sh
 ./LCD35-lite-status
@@ -44,7 +52,7 @@ ls -l /dev/fb* /dev/input/event*
 free -h
 ```
 
-O instalador acrescenta ao fim de `config.txt` um bloco entre os marcadores LUMI. O filtro `[all]` limpa os filtros para o bloco depois da última linha do usuário. Um `dtparam=spi=on` global já existente é reaproveitado. Se houver um overlay anterior cujo escopo de parâmetros possa estar aberto, o bloco carrega o tft35a, fecha o escopo com `dtoverlay=` e só então configura o SPI na árvore base. O tft35a também habilita SPI0 diretamente. SPI desligado, condicional ou duplicado, overlays conflitantes conhecidos, includes, caminhos de overlay personalizados, árvore de dispositivos explícita e diretivas `gpio=` exigem revisão manual. Overlays personalizados e HATs podem reservar o mesmo SPI ou GPIO sem aparecer nessas verificações. Revise a pinagem antes de gravar. [Semântica do config.txt](https://www.raspberrypi.com/documentation/computers/config_txt.html)
+O instalador acrescenta ao fim de `config.txt` um bloco entre os marcadores LUMI. O filtro `[all]` limpa os filtros para o bloco depois da última linha do usuário. Um `dtparam=spi=on` global já existente é reaproveitado. Se houver um overlay anterior cujo escopo de parâmetros possa estar aberto, o bloco carrega o tft35a, fecha o escopo com `dtoverlay=` e só então configura o SPI na árvore base. O tft35a também habilita SPI0 diretamente. SPI desligado, condicional ou duplicado, overlays conflitantes conhecidos, includes, caminhos de overlay personalizados, árvore de dispositivos explícita e diretivas `gpio=` exigem revisão manual. A instalação local também consulta os dispositivos ativos `spi0.0` e `spi0.1` e recusa drivers concorrentes. A análise estática reconhece nomes conflitantes e referências comuns a SPI0 nos binários disponíveis. Overlays personalizados, HATs e conflitos de GPIO podem escapar a essas verificações. Revise a pinagem antes de gravar. [Semântica do config.txt](https://www.raspberrypi.com/documentation/computers/config_txt.html)
 
 Um `tft35a.dtbo` existente com o mesmo SHA-256 é reutilizado. Um binário diferente exige revisão e backup externos. A instalação base funciona sem rede. Não há reinicialização automática. `--boot-dir` aponta para uma partição explícita que já contém `config.txt` e `overlays/`:
 
@@ -60,6 +68,8 @@ Prepare e monte a imagem fora do instalador, de preferência com acesso de escri
 
 - **Tela branca:** com o Pi desligado, confirme modelo, encaixe e pinagem. Após o boot, confira o bloco e o hash, e procure SPI0/CE0 e CE1 no status. Backlight aceso por si só não indica que o driver iniciou o painel. Verifique erros de SPI, GPIO e inicialização no log. Use `sudo ./LCD35-lite-status` se o acesso ao dmesg for restrito.
 - **Sem framebuffer:** confira o vínculo de `spi0.0` e `/proc/fb`. No kernel alvo, procure `CONFIG_FB_TFT_ILI9486`, `CONFIG_TOUCHSCREEN_ADS7846` e `CONFIG_SPI_BCM2835` no arquivo de configuração disponibilizado pelo sistema ou com `modinfo fb_ili9486` e `modinfo ads7846`. KMS/HDMI podem criar outro framebuffer. Compare nomes, barramento e formato no status; use `--fb /dev/fbN` após identificar o SPI. Um formato diferente de RGB565 é diagnosticado pelo status e rejeitado pelo renderizador.
+- **Driver diferente em SPI0/CE0:** o FBTFT registra `ilitek,ili9486`. O DRM ILI9486 tem outros identificadores OF, mas a busca SPI pode recorrer ao modalias `spi:ili9486`. Confira `readlink /sys/bus/spi/devices/spi0.0/driver` e os aliases com `modinfo -F alias fb_ili9486` e `modinfo -F alias ili9486`. O instalador não altera a ordem dos módulos nem o VC4. [Correspondência SPI do kernel](https://github.com/raspberrypi/linux/blob/rpi-6.18.y/drivers/spi/spi.c) · [Driver ILI9486 DRM](https://github.com/raspberrypi/linux/blob/rpi-6.18.y/drivers/gpu/drm/tiny/ili9486.c)
+- **Cores trocadas:** confira o padrão vermelho/verde/azul abaixo. O FBTFT interpreta `bgr` pela presença da propriedade, e o overlay legado a inclui como célula com valor zero. Confira a revisão do painel antes de alterar o ativo.
 - **Driver fbtft indisponível:** para hardware comprovadamente compatível com PiScreen, avalie o overlay oficial `piscreen` com o parâmetro `drm` (quando disponível no kernel/firmware da imagem) e o driver DRM ILI9486. Faça o teste separadamente após a reversão deste instalador. O PiScreen tem sequência de inicialização diferente e inclui BCM22 para backlight. Compare a fiação, os parâmetros e a posição das telas antes de usar. Verifique a emulação fbdev e seus bitfields. Se expuser XRGB8888, a demo atual precisará de um renderizador para esse formato ou de um cliente DRM. [Overlay PiScreen](https://github.com/raspberrypi/linux/blob/rpi-6.12.y/arch/arm/boot/dts/overlays/piscreen-overlay.dts) · [Driver DRM ILI9486](https://github.com/torvalds/linux/blob/master/drivers/gpu/drm/tiny/ili9486.c)
 - **Touch ausente ou invertido:** confira `spi0.1` e o evento com ABS_X, ABS_Y e BTN_TOUCH. Selecione o dispositivo explicitamente e calibre após qualquer alteração de rotação. Confirme que o usuário tem acesso ao dispositivo.
 
@@ -76,9 +86,9 @@ python3 lumi-lcd/demo.py --rotate 90 --calibrate --calibration "$HOME/.config/lu
 python3 lumi-lcd/demo.py --rotate 90 --calibration "$HOME/.config/lumi/touch.json"
 ```
 
-Use `--fb /dev/fbN` e `--touch /dev/input/eventN` se houver ambiguidade. Para o touch é possível indicar um link estável. A calibração pede toques próximos aos quatro cantos, em sentido horário a partir do superior esquerdo, e depois no centro. O quarto canto e o centro verificam a tolerância da transformação. Ao reabrir a demo, toque nos cinco pontos e compare com o cursor exibido. Sem calibração, é possível experimentar `--swap-axes`, `--invert-x`, `--invert-y` e `--rotate`. A rotação da demo documenta a orientação aplicada pelo overlay e ajusta o touch sem calibração.
+Use `--fb /dev/fbN` e `--touch /dev/input/eventN` se houver ambiguidade. Para o touch é possível indicar um link estável. A seleção exige identificação ADS7846 compatível, barramento SPI e capacidades ABS_X, ABS_Y e BTN_TOUCH. A demo encerra com mensagem em caso de desconexão. Reconecte o dispositivo e execute novamente. A calibração pede toques próximos aos quatro cantos, em sentido horário a partir do superior esquerdo, e depois no centro. O quarto canto e o centro verificam a tolerância da transformação. Ao reabrir a demo, toque nos cinco pontos e compare com o cursor exibido. Sem calibração, é possível experimentar `--swap-axes`, `--invert-x`, `--invert-y` e `--rotate`. A rotação da demo documenta a orientação aplicada pelo overlay e ajusta o touch sem calibração.
 
-Cada toque alterna entre aguardando, escutando, processando e falando. A demo bloqueia enquanto aguarda eventos e encerra via SIGTERM. Para integração futura, um adaptador do Message Bus OVOS pode traduzir eventos de sessão para essas quatro chaves, enviá-las à mesma fila de desenho e ignorar estados repetidos. Mantenha uma única rotina escrevendo no framebuffer.
+Cada toque alterna entre aguardando, escutando, processando e falando. A demo reutiliza fontes, limita a 8 atualizações por segundo, agrupa toques próximos e bloqueia enquanto aguarda eventos. Uma imagem estática não é redesenhada. SIGTERM encerra a demo e libera os dispositivos. Para integração futura, um adaptador do Message Bus OVOS pode traduzir eventos de sessão para essas quatro chaves, enviá-las à mesma fila de desenho e ignorar estados repetidos. Mantenha uma única rotina escrevendo no framebuffer.
 
 A unidade opcional em `systemd/lumi-display-demo.service` usa `lumi-display` e inicia em modo sem touch. Se quiser testá-la, crie o usuário com `sudo useradd --system --user-group --no-create-home --shell /usr/sbin/nologin lumi-display`, copie `demo.py`, `framebuffer.py` e `touch.py` para `/opt/lumi-lcd/` com proprietário root e permissões de leitura, e copie a unidade para `/etc/systemd/system/`. Após `sudo systemctl daemon-reload`, use `sudo systemctl start lumi-display-demo` e consulte `journalctl -u lumi-display-demo`. Ajuste o grupo ou o parâmetro `--fb` conforme o status do Pi. A unidade limita tentativas de reinício e permanece desabilitada até habilitação explícita.
 
@@ -92,14 +102,26 @@ sudo reboot
 
 O manifesto `.lumi-lcd35.json` no boot guarda caminhos, cópia original da configuração, hashes, UID/GID, permissões e a indicação de overlay criado. Em FAT, proprietário e permissões seguem as opções da montagem. O backup original permanece durante as reinstalações e é removido após uma restauração concluída. Arquive-o externamente se quiser retê-lo. A restauração remove o bloco intacto no final e conserva alterações feitas antes dele. Se houver linhas após o bloco, alterações no bloco, no overlay ou indícios de conflito, revise manualmente. Em particular, linhas acrescentadas após `[all]` podem depender desse filtro. Só remova o bloco após confirmar o escopo desejado.
 
-O lock serializa comandos Lite sobre o mesmo diretório de boot. As substituições são atômicas por arquivo. O diário `.lumi-lcd35-pending.json` registra estados anteriores e propostos para rollback em falha parcial. Se houver interrupção abrupta, examine o diário antes de reiniciar e execute `restore` para recuperar a transação e então restaurar a instalação. A recuperação para se encontrar arquivos diferentes dos dois estados registrados. Em cartões FAT, perda de energia ou corrupção do sistema de arquivos ainda pode exigir recuperação externa. Mantenha uma cópia do cartão antes da primeira instalação.
+O lock serializa comandos Lite sobre o mesmo diretório de boot. As substituições são atômicas por arquivo. O diário `.lumi-lcd35-pending.json` registra estados anteriores e propostos para rollback em falha parcial. Se houver interrupção abrupta, preserve uma cópia da partição e examine o plano antes de reiniciar:
+
+```sh
+./LCD35-lite-status
+sudo ./LCD35-lite-restore --recover-only --dry-run
+sudo ./LCD35-lite-restore --recover-only
+./LCD35-lite-status
+```
+
+A recuperação valida caminhos, hashes e a relação entre configuração, manifesto e overlay, verifica todos os arquivos antes da primeira escrita e retorna ao estado imediatamente anterior à transação. Uma reinstalação interrompida volta à instalação anterior. Execute a restauração normal separadamente, se quiser remover essa instalação. Se houver divergência em disco ou diário ilegível, preserve os arquivos e revise a cópia da partição antes de intervir. Em cartões FAT, perda de energia ou corrupção do sistema de arquivos ainda pode exigir recuperação externa. Mantenha uma cópia do cartão antes da primeira instalação.
 
 ## Testes e validação no Pi 3
 
 ```sh
 for script in LCD35-lite-show LCD35-lite-restore LCD35-lite-status; do bash -n "$script" || break; done
-PYTHONPATH=lumi-lcd python3 -B -m unittest discover -s lumi-lcd/tests -v
+python3 -B -m unittest discover -s lumi-lcd/tests -v
+python3 -B -W error::DeprecationWarning -m unittest discover -s lumi-lcd/tests -v
 ```
+
+Os testes automatizados exercitam o parser, o dry-run inalterado, rollback e recuperação, sysfs e ioctl simulados, formatos de pixels, permissões e eventos de touch. Faça a homologação física com alimentação estável. `vcgencmd get_throttled` ajuda a registrar subtensão atual ou anterior, e `vcgencmd measure_temp` registra a temperatura. Preserve os mecanismos elétricos e térmicos da placa.
 
 Para verificar as cores primárias sem o touch, desenhe três faixas no framebuffer SPI já identificado:
 

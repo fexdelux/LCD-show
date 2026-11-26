@@ -7,11 +7,14 @@ import mmap
 import os
 from pathlib import Path
 import re
+import stat
 import sys
 
 
 FBIOGET_VSCREENINFO = 0x4600
 FBIOGET_FSCREENINFO = 0x4602
+GRAPHICS = Path("/sys/class/graphics")
+PANEL_DRIVER = "fb_ili9486"
 
 
 class Bitfield(c.Structure):
@@ -56,7 +59,10 @@ class Layout:
 
     @classmethod
     def from_info(cls, fixed, var):
-        if (fixed.type, fixed.visual, var.bits_per_pixel, var.grayscale, var.nonstd) != (0, 2, 16, 0, 0):
+        # Raspberry Pi Linux fbtft sets nonstd=1 even with the RGB565 bitfields below.
+        native_fbtft = fixed.id == PANEL_DRIVER.encode() and var.nonstd == 1
+        if ((fixed.type, fixed.visual, var.bits_per_pixel, var.grayscale) != (0, 2, 16, 0)
+                or (var.nonstd and not native_fbtft)):
             raise ValueError("Formato não suportado: esperado RGB565 packed truecolor de 16 bpp.")
         if ([var.red.values(), var.green.values(), var.blue.values()]
                 != [(11, 5, 0), (5, 6, 0), (0, 5, 0)] or var.transp.length):
@@ -99,23 +105,24 @@ def draw_rgb(buffer, layout, rgb, byteorder=sys.byteorder):
         buffer[offset:offset + row_size] = packed[row * row_size:(row + 1) * row_size]
 
 
-def candidates(sysfs=Path("/sys/class/graphics"), devices=Path("/dev")):
-    found = []
-    for fb in sorted(sysfs.glob("fb*")):
-        device = devices / fb.name
-        if not re.fullmatch(r"fb[0-9]+", fb.name) or not device.exists():
-            continue
-        spi_device = (fb / "device").resolve()
-        if not any(part.startswith("spi") and re.fullmatch(r"spi\d+\.\d+", part)
-                   for part in spi_device.parts):
-            continue
-        try:
-            name = (fb / "name").read_text().lower()
-        except OSError:
-            continue
-        if "ili9486" in name:
-            found.append(device)
-    return found
+def spi_panel(entry):
+    """Require both the fbdev identity and the bound SPI parent's driver."""
+    try:
+        if (entry / "name").read_text().strip().lower() != PANEL_DRIVER:
+            return False
+        device = (entry / "device").resolve(strict=True)
+        for parent in (device, *device.parents):
+            if re.fullmatch(r"spi[0-9]+\.[0-9]+", parent.name):
+                return (parent / "driver").resolve(strict=True).name == PANEL_DRIVER
+    except OSError:
+        pass
+    return False
+
+
+def candidates(sysfs=GRAPHICS, devices=Path("/dev")):
+    return [devices / entry.name for entry in sorted(sysfs.glob("fb*"))
+            if re.fullmatch(r"fb[0-9]+", entry.name) and spi_panel(entry)
+            and (devices / entry.name).exists()]
 
 
 def select_fb(explicit=None):
@@ -124,9 +131,21 @@ def select_fb(explicit=None):
             raise ValueError("Informe um framebuffer no formato /dev/fbN.")
         return Path(explicit)
     found = candidates()
-    if len(found) != 1:
-        raise ValueError(f"Encontrados {len(found)} framebuffers SPI ILI9486. Consulte LCD35-lite-status e use --fb.")
+    if not found:
+        raise ValueError("Nenhum framebuffer SPI ILI9486 disponível. Consulte LCD35-lite-status após o boot.")
+    if len(found) > 1:
+        raise ValueError("Vários framebuffers SPI ILI9486. Consulte LCD35-lite-status e use --fb /dev/fbN.")
     return found[0]
+
+
+def verify_write_target(path, fd):
+    entry = GRAPHICS / path.name
+    info = os.fstat(fd)
+    if not stat.S_ISCHR(info.st_mode) or not spi_panel(entry):
+        raise ValueError(f"{path} não foi identificado como framebuffer SPI ILI9486.")
+    actual = f"{os.major(info.st_rdev)}:{os.minor(info.st_rdev)}"
+    if (entry / "dev").read_text().strip() != actual:
+        raise ValueError(f"{path} não corresponde ao dispositivo identificado no sysfs.")
 
 
 class Framebuffer:
@@ -135,12 +154,21 @@ class Framebuffer:
         self.writable = writable
 
     def __enter__(self):
-        self.fd = os.open(self.path, os.O_RDWR if self.writable else os.O_RDONLY)
         try:
+            flags = os.O_RDWR if self.writable else os.O_RDONLY
+            self.fd = os.open(self.path, flags | os.O_NOFOLLOW)
+        except PermissionError as error:
+            access = "leitura e gravação" if self.writable else "leitura"
+            raise PermissionError(f"Sem acesso de {access} a {self.path}. Confira as permissões do dispositivo.") from error
+        try:
+            if self.writable:
+                verify_write_target(self.path, self.fd)
             self.fixed, self.var = FixInfo(), VarInfo()
             fcntl.ioctl(self.fd, FBIOGET_FSCREENINFO, self.fixed)
             fcntl.ioctl(self.fd, FBIOGET_VSCREENINFO, self.var)
             if self.writable:
+                if self.fixed.id.decode(errors="replace").lower() != PANEL_DRIVER:
+                    raise ValueError(f"{self.path}: identidade retornada pelo ioctl não corresponde ao painel SPI.")
                 self.layout = Layout.from_info(self.fixed, self.var)
                 self.buffer = mmap.mmap(self.fd, self.layout.size, access=mmap.ACCESS_WRITE)
         except BaseException:
@@ -151,16 +179,23 @@ class Framebuffer:
     def describe(self):
         fix, var = self.fixed, self.var
         fields = [getattr(var, field).values() for field in ("red", "green", "blue", "transp")]
+        try:
+            Layout.from_info(fix, var)
+            pixel_format = "RGB565"
+        except ValueError as error:
+            pixel_format = str(error)
         return (f"{self.path}: {fix.id.decode(errors='replace')} {var.xres}×{var.yres}"
                 f" virtual={var.xres_virtual}×{var.yres_virtual}"
                 f" offset={var.xoffset},{var.yoffset} bpp={var.bits_per_pixel}"
                 f" stride={fix.line_length} memória={fix.smem_len} tipo={fix.type} visual={fix.visual}"
-                f" bitfields RGBA (offset, bits, msb_right)={fields}")
+                f" bitfields RGBA (offset, bits, msb_right)={fields} | {pixel_format}")
 
     def draw(self, image):
         if image.size != (self.layout.width, self.layout.height):
             raise ValueError("Dimensões da imagem não correspondem ao framebuffer.")
-        draw_rgb(self.buffer, self.layout, image.convert("RGB").tobytes())
+        if image.mode != "RGB":
+            image = image.convert("RGB")
+        draw_rgb(self.buffer, self.layout, image.tobytes())
 
     def __exit__(self, *_):
         try:

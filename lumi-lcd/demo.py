@@ -2,11 +2,13 @@
 """Event-driven LUMI screen and guided touch calibration."""
 import argparse
 from contextlib import ExitStack
+from functools import lru_cache
 import os
 from pathlib import Path
 from selectors import DefaultSelector, EVENT_READ
 import signal
 import sys
+from time import monotonic
 
 from framebuffer import Framebuffer
 from touch import (TARGETS, Touch, apply_affine, fit_calibration, load_calibration,
@@ -21,29 +23,38 @@ STATES = {
 }
 
 
+FRAME_INTERVAL = 1 / 8
+
+
+@lru_cache(maxsize=6)
+def font_for(size, bold):
+    from PIL import ImageFont
+
+    name = "DejaVuSans-Bold.ttf" if bold else "DejaVuSans.ttf"
+    try:
+        return ImageFont.truetype(f"/usr/share/fonts/truetype/dejavu/{name}", size), False
+    except OSError:
+        return ImageFont.load_default(), True
+
+
 def draw(fb, state, target=None, cursor=None, hint=None):
-    from PIL import Image, ImageDraw, ImageFont
+    from PIL import Image, ImageDraw
 
     width, height = fb.layout.width, fb.layout.height
     image = Image.new("RGB", (width, height), "#101922")
     canvas = ImageDraw.Draw(image)
     label, color = STATES[state]
-    fonts = Path("/usr/share/fonts/truetype/dejavu")
-
     def text(label, y, size, fill, bold=False):
-        name = "DejaVuSans-Bold.ttf" if bold else "DejaVuSans.ttf"
-        try:
-            font = ImageFont.truetype(os.fspath(fonts / name), size)
-        except OSError:
-            font = ImageFont.load_default()
-            left, top, right, bottom = font.getbbox(label)
-            mask = Image.new("L", (right - left, bottom - top))
-            ImageDraw.Draw(mask).text((-left, -top), label, fill=255, font=font)
-            scale = max(1, min(size // mask.height, width // mask.width))
-            mask = mask.resize((mask.width * scale, mask.height * scale), Image.NEAREST)
-            image.paste(fill, ((width - mask.width) // 2, round(y - mask.height / 2)), mask)
-        else:
+        font, fallback = font_for(size, bold)
+        if not fallback:
             canvas.text((width // 2, y), label, anchor="mm", fill=fill, font=font)
+            return
+        left, top, right, bottom = font.getbbox(label)
+        mask = Image.new("L", (right - left, bottom - top))
+        ImageDraw.Draw(mask).text((-left, -top), label, fill=255, font=font)
+        scale = max(1, min(size // mask.height, width // mask.width))
+        mask = mask.resize((mask.width * scale, mask.height * scale), getattr(Image, "Resampling", Image).NEAREST)
+        image.paste(fill, ((width - mask.width) // 2, round(y - mask.height / 2)), mask)
 
     text("LUMI", height * 0.36, max(12, width // 9), "#f5f8fa", bold=True)
     text(label, height * 0.59, max(10, width // 16), color)
@@ -79,30 +90,41 @@ def run(args, resources):
     selector = resources.enter_context(DefaultSelector())
     selector.register(device.fd, EVENT_READ)
     samples = []
-    state = args.state
-    draw(fb, state, TARGETS[0] if args.calibrate else None,
-         hint="Toque nos alvos" if args.calibrate else "Toque para mudar de estado")
+    names = tuple(STATES)
+    state = names.index(args.state)
+    frame = (args.state, TARGETS[0] if args.calibrate else None, None)
+    shown = None
+    next_frame = 0
+    hint = "Toque nos alvos" if args.calibrate else "Toque para mudar de estado"
     while True:
-        selector.select()
-        try:
-            taps = list(touch.taps())
-        except BlockingIOError:
+        now = monotonic()
+        if frame != shown and now >= next_frame:
+            draw(fb, *frame, hint=hint)
+            shown = frame
+            next_frame = now + FRAME_INTERVAL
+        timeout = None if frame == shown else max(0, next_frame - monotonic())
+        if not selector.select(timeout):
             continue
-        for point in taps:
-            if args.calibrate:
-                samples.append(point)
-                if len(samples) == len(TARGETS):
-                    matrix = fit_calibration(samples)
-                    save_calibration(args.calibration, identity, matrix)
-                    print(f"Calibração salva em {args.calibration}.")
-                    return
-                draw(fb, state, TARGETS[len(samples)], hint="Toque nos alvos")
-            else:
-                cursor = (apply_affine(matrix, point) if matrix else
-                          orient(*point, args.rotate, args.swap_axes, args.invert_x, args.invert_y))
-                names = tuple(STATES)
-                state = names[(names.index(state) + 1) % len(names)]
-                draw(fb, state, cursor=cursor, hint="Toque para mudar de estado")
+        taps = list(touch.taps())
+        if not taps:
+            continue
+        if args.calibrate:
+            # Accept one sample per visible target, discarding queued repeats.
+            if frame != shown:
+                continue
+            samples.append(taps[0])
+            if len(samples) == len(TARGETS):
+                matrix = fit_calibration(samples)
+                save_calibration(args.calibration, identity, matrix)
+                print(f"Calibração salva em {args.calibration}.")
+                return
+            frame = (names[state], TARGETS[len(samples)], None)
+        else:
+            point = taps[-1]
+            cursor = (apply_affine(matrix, point) if matrix else
+                      orient(*point, args.rotate, args.swap_axes, args.invert_x, args.invert_y))
+            state = (state + len(taps)) % len(names)
+            frame = (names[state], None, cursor)
 
 
 def stop(*_):
